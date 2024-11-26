@@ -1,55 +1,126 @@
-from fastapi import FastAPI, HTTPException, UploadFile, Form
+from fastapi import FastAPI, HTTPException, Header, Depends
 import pandas as pd
-import logging
-from sqlalchemy import create_engine, inspect, Table, Column, MetaData, text
-from sqlalchemy.dialects.postgresql import VARCHAR, FLOAT, INTEGER
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy import create_engine, inspect, Table, Column, MetaData, text, select, DateTime, Integer, Float, String
+from sqlalchemy.dialects.postgresql import VARCHAR, FLOAT, INTEGER, TIMESTAMP
 import aiohttp
+from pydantic_settings import BaseSettings
 import io
-from sqlalchemy.dialects.postgresql import TIMESTAMP
+from pydantic import BaseModel
+from typing import Optional
+import os
+from sqlalchemy import Index
+from sqlalchemy.dialects.postgresql import VARCHAR, FLOAT, INTEGER, TIMESTAMP
+from urllib.parse import urlparse
 
-# Set up logging
-logging.basicConfig(level=logging.DEBUG)
-logger = logging.getLogger(__name__)
+class Settings(BaseSettings):
+    DB_URL: str
+    API_TOKEN: str
+
+    class Config:
+        env_file = ".env"
+
+settings = Settings()
 
 app = FastAPI()
 
 # Database Configuration
-DB_URL = "postgresql+psycopg2://payjo:payjo@localhost:5432/csv_db"
-engine = create_engine(DB_URL)
+engine = create_engine(settings.DB_URL)
 metadata = MetaData()
 
+# Create a metadata table to track URLs and their associated tables
+url_metadata_table = Table(
+    "url_metadata", metadata,
+    Column("url", VARCHAR, primary_key=True),
+    Column("table_name", VARCHAR, unique=True)
+)
+metadata.create_all(engine)
+
+def authenticate_user(authorization: Optional[str] = Header(None)):
+    if authorization != f"Bearer {settings.API_TOKEN}":
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+class FileLinkRequest(BaseModel):
+    url: str
+
+
+def create_indexes_for_table(table, df, dtype_map):
+    # Create GIN indexes for string columns
+    for col, dtype in df.dtypes.items():
+        if dtype == "object":  # For string columns
+            index_name = f"{table.name}_{col}_gin_index"
+            # Create GIN index using raw SQL for text columns
+            with engine.connect() as conn:
+                conn.execute(
+                    text(f'CREATE INDEX IF NOT EXISTS {index_name} ON {table.name} USING gin ({col} gin_trgm_ops)')
+                )
+    
+        if dtype == "datetime64[ns]":  # For date columns
+            index_name = f"{table.name}_{col}_date_index"
+            index = Index(index_name, Column(str(col), TIMESTAMP))
+            index.create(bind=engine)
+
+        if dtype in ["int64", "float64"]:  # For numeric columns
+            index_name = f"{table.name}_{col}_btree_index"
+            index = Index(index_name, Column(str(col), dtype_map.get(str(dtype), VARCHAR)))
+            index.create(bind=engine)
+
+def generate_table_name(url: str, existing_tables: set) -> str:
+    # Extract file name from URL
+    parsed_url = urlparse(url)
+    file_name = os.path.basename(parsed_url.path).split("?")[0]  # Remove query params if any
+    table_name_base = file_name.replace(".", "_") if file_name else "csv_data"
+
+    # Ensure uniqueness
+    table_name = table_name_base
+    counter = 1
+    while table_name in existing_tables:
+        table_name = f"{table_name_base}_{counter}"
+        counter += 1
+
+    return table_name
+
+def handle_month_year_date(date_value):
+    if isinstance(date_value, str):
+        parts = date_value.split()
+        if len(parts) == 2:
+            return f"{parts[0]} 1, {parts[1]}"
+    return date_value
+
 @app.post("/upload-csv/")
-async def upload_csv(file_link: str = Form(...)):
-    """
-    Upload CSV from a public link and save its content to PostgreSQL.
-    """
+async def upload_csv(
+    request: FileLinkRequest,
+    authorization: str = Depends(authenticate_user)
+):
     try:
-        # Download and process CSV
+        # Check if URL already exists in metadata table
+        with engine.connect() as conn:
+            result = conn.execute(
+                text("SELECT table_name FROM url_metadata WHERE url = :url"), {"url": request.url}
+            )
+            existing_entry = result.fetchone()
+            if existing_entry:
+                raise HTTPException(
+                    status_code=200,
+                    detail=f"The data of the parsed csv is already present in DB'."
+                )
+
+        # Download CSV
         async with aiohttp.ClientSession() as session:
-            async with session.get(file_link) as response:
+            async with session.get(request.url) as response:
                 if response.status != 200:
                     raise HTTPException(status_code=400, detail="Failed to download CSV file.")
                 csv_data = await response.text()
-        
-        logger.debug("Reading CSV data")
+
+        # Parse CSV
         df = pd.read_csv(io.StringIO(csv_data))
-        logger.debug(f"DataFrame shape: {df.shape}")
-        
-        # Clean column names - remove special characters and spaces
-        df.columns = [col.strip().replace(' ', '_').replace('/', '_').replace('-', '_') 
-                     for col in df.columns]
-        
-        # Handle missing column names
+        df.columns = [col.strip().lower().replace(' ', '_').replace('/', '_').replace('-', '_') for col in df.columns]
+
         if df.columns.hasnans:
             df.columns = [
                 f"test_col{i}" if col.startswith("Unnamed") or pd.isna(col) else col
                 for i, col in enumerate(df.columns)
             ]
-        
-        logger.debug(f"Columns after cleaning: {df.columns.tolist()}")
-        
-        # Process date columns
+
         for col in df.columns:
             if "date" in col.lower() or "release" in col.lower():
                 try:
@@ -57,11 +128,9 @@ async def upload_csv(file_link: str = Form(...)):
                     df[col] = pd.to_datetime(df[col], errors='coerce', format="%b %d, %Y")
                 except ValueError:
                     pass
-        
-        # Fill NaN values
+
         df = df.fillna(method='ffill')
-        
-        # Prepare table schema
+
         dtype_map = {
             "object": VARCHAR,
             "float64": FLOAT,
@@ -73,17 +142,18 @@ async def upload_csv(file_link: str = Form(...)):
             Column(str(col), dtype_map.get(str(dtype), VARCHAR)) 
             for col, dtype in df.dtypes.items()
         ]
-        
+
+        # Generate unique table name
+        existing_tables = set(inspect(engine).get_table_names())
+        table_name = generate_table_name(request.url, existing_tables)
+
         # Create table
-        table_name = "csv_data"
-        if inspect(engine).has_table(table_name):
-            metadata.reflect(bind=engine)
-            metadata.drop_all(bind=engine, tables=[metadata.tables[table_name]])
-        
         table = Table(table_name, metadata, *table_columns, extend_existing=True)
         metadata.create_all(engine)
-        
-        # Convert DataFrame to list of dicts with proper handling of data types
+
+        # Create indexes for columns in the created table
+        create_indexes_for_table(table, df, dtype_map)
+
         records = []
         for _, row in df.iterrows():
             record = {}
@@ -96,60 +166,83 @@ async def upload_csv(file_link: str = Form(...)):
                 else:
                     record[str(column)] = value
             records.append(record)
-            
-        logger.debug(f"Sample record structure: {records[0] if records else 'No records'}")
-        
-        # Database insertion with explicit transaction
+
         with engine.begin() as connection:
-            logger.debug("Starting database insertion")
-            
             try:
-                # Insert records one by one to better handle errors
-                for idx, record in enumerate(records):
-                    try:
-                        connection.execute(table.insert().values(**record))
-                        if idx % 100 == 0:  # Log progress every 100 records
-                            logger.debug(f"Inserted {idx + 1} records")
-                    except Exception as e:
-                        logger.error(f"Error inserting record {idx}: {str(e)}")
-                        logger.error(f"Problematic record: {record}")
-                        raise
+                for record in records:
+                    connection.execute(table.insert().values(**record))
                 
-                # Verify record count
+                # Insert URL and table name into metadata table
+                connection.execute(
+                    url_metadata_table.insert().values(url=request.url, table_name=table_name)
+                )
+
                 result = connection.execute(text(f"SELECT COUNT(*) FROM {table_name}"))
                 count = result.scalar()
-                logger.debug(f"Verified {count} records in database")
-                
             except Exception as e:
-                logger.error(f"Error during insertion: {str(e)}")
-                raise
-        
-        # Final verification
-        with engine.connect() as conn:
-            result = conn.execute(text(f"SELECT COUNT(*) FROM {table_name}"))
-            final_count = result.scalar()
-            logger.debug(f"Final record count: {final_count}")
-            
-            if final_count == 0:
-                raise Exception("No records were persisted in the database")
-            
-            # Get sample of inserted data
-            sample_result = conn.execute(text(f"SELECT * FROM {table_name} LIMIT 1"))
-            sample_data = sample_result.fetchone()
-            
-            return {
-                "message": "CSV uploaded and saved successfully.",
-                "records_processed": final_count,
-                "sample_record": dict(sample_data._mapping) if sample_data else None
-            }
-    
+                raise HTTPException(status_code=500, detail=f"Insertion error: {str(e)}")
+
+        return {
+            "message": "CSV uploaded and saved successfully.",
+            "table_name": table_name,
+            "records_processed": count
+        }
+
     except Exception as e:
-        logger.error(f"Error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
-def handle_month_year_date(date_value):
-    if isinstance(date_value, str):
-        parts = date_value.split()
-        if len(parts) == 2:
-            return f"{parts[0]} 1, {parts[1]}"
-    return date_value
+
+@app.post("/data-explorer/")
+async def data_explorer(
+    filters: dict,  
+    authorization: str = Depends(authenticate_user)
+):
+
+    url = filters.get("url")
+    if not url:
+        raise HTTPException(status_code=400, detail="URL is required")
+    
+    with engine.connect() as conn:
+        result = conn.execute(
+            text("SELECT table_name FROM url_metadata WHERE url = :url"), {"url": url}
+        )
+        row = result.fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="URL not found in the database")
+
+
+    table = Table(row[0], metadata, autoload_with=engine)
+
+    query = select(table)
+
+
+    for field, value in filters.items():
+        if field != "url":
+            field = field.lower().replace(" ", "_").replace("/", "_").replace("-", "_")
+            if field in table.columns:
+                column = table.columns[field]
+                # Handle numerical, string, and date types
+                if isinstance(column.type, (Integer, Float)):
+                    # For numerical fields, exact match
+                    query = query.where(column == value)
+                elif isinstance(column.type, String):
+                    # For string fields, substring match
+                    query = query.where(column.ilike(f"%{value}%"))
+                elif isinstance(column.type, DateTime):
+                    # For date fields, exact match
+                    query = query.where(column == value)
+                else:
+                    raise HTTPException(status_code=400, detail="Unsupported field type")
+            else:
+                raise HTTPException(status_code=400, detail=f"Field '{field}' not found in table")
+
+    # Execute the query and return the results
+    with engine.connect() as conn:
+        result = conn.execute(query)
+        records = result.fetchall()
+
+        if records:
+            return {"data": [row._asdict() for row in records]}
+        else:
+            return {"data": []}

@@ -1,0 +1,7 @@
+fastapi
+aiohttp
+sqlalchemy
+pydantic
+pandas
+psycopg2-binary
+urllib
