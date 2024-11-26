@@ -5,7 +5,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends gcc
 
 COPY requirements.txt .
-
+COPY .env .env
 RUN pip install --upgrade pip
 RUN pip install --no-cache-dir -r requirements.txt
 
